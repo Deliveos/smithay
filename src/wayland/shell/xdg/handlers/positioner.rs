@@ -81,7 +81,8 @@ where
                 parent_width,
                 parent_height,
             } => {
-                state.parent_size = Some((parent_width, parent_height).into());
+                // The protocol defines no error for this request, and a Size can't be negative.
+                state.parent_size = Some((parent_width.max(0), parent_height.max(0)).into());
             }
             xdg_positioner::Request::SetParentConfigure { serial } => {
                 state.parent_configure = Some(Serial::from(serial));
