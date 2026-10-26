@@ -578,9 +578,7 @@ impl PositionerState {
     /// Defined by `xdg_positioner.set_anchor_rect` and
     /// `xdg_positioner.set_anchor`.
     pub fn get_anchor_point(&self) -> Point<i32, Logical> {
-        let mut point = self.anchor_rect.loc;
-
-        point.y += if self.anchor_has_edge(xdg_positioner::Anchor::Top) {
+        let y = if self.anchor_has_edge(xdg_positioner::Anchor::Top) {
             0
         } else if self.anchor_has_edge(xdg_positioner::Anchor::Bottom) {
             self.anchor_rect.size.h
@@ -588,7 +586,7 @@ impl PositionerState {
             self.anchor_rect.size.h / 2
         };
 
-        point.x += if self.anchor_has_edge(xdg_positioner::Anchor::Left) {
+        let x = if self.anchor_has_edge(xdg_positioner::Anchor::Left) {
             0
         } else if self.anchor_has_edge(xdg_positioner::Anchor::Right) {
             self.anchor_rect.size.w
@@ -596,7 +594,8 @@ impl PositionerState {
             self.anchor_rect.size.w / 2
         };
 
-        point
+        // The anchor rect comes from the client; Point addition saturates instead of overflowing.
+        self.anchor_rect.loc + Point::from((x, y))
     }
 
     pub(crate) fn gravity_has_edge(&self, edge: xdg_positioner::Gravity) -> bool {
@@ -666,15 +665,15 @@ impl PositionerState {
         // surface will be centered over the anchor point on any axis that had no
         // gravity specified.
         if self.gravity_has_edge(xdg_positioner::Gravity::Top) {
-            geometry.loc.y -= geometry.size.h;
+            geometry.loc.y = geometry.loc.y.saturating_sub(geometry.size.h);
         } else if !self.gravity_has_edge(xdg_positioner::Gravity::Bottom) {
-            geometry.loc.y -= geometry.size.h / 2;
+            geometry.loc.y = geometry.loc.y.saturating_sub(geometry.size.h / 2);
         }
 
         if self.gravity_has_edge(xdg_positioner::Gravity::Left) {
-            geometry.loc.x -= geometry.size.w;
+            geometry.loc.x = geometry.loc.x.saturating_sub(geometry.size.w);
         } else if !self.gravity_has_edge(xdg_positioner::Gravity::Right) {
-            geometry.loc.x -= geometry.size.w / 2;
+            geometry.loc.x = geometry.loc.x.saturating_sub(geometry.size.w / 2);
         }
 
         geometry
@@ -748,9 +747,10 @@ impl PositionerState {
             // Prefer to show the top-left corner of the popup so that we can easily do a resize
             // adjustment next.
             if off_left > 0 {
-                geo.loc.x += off_left;
+                geo.loc.x = geo.loc.x.saturating_add(off_left);
             } else if off_right > 0 {
-                geo.loc.x -= min(off_right, -off_left);
+                let shift = min(off_right, off_left.saturating_neg());
+                geo.loc.x = geo.loc.x.saturating_sub(shift);
             }
 
             (off_left, off_right, _, _) = compute_offsets(target, geo);
@@ -764,9 +764,10 @@ impl PositionerState {
             // Prefer to show the top-left corner of the popup so that we can easily do a resize
             // adjustment next.
             if off_top > 0 {
-                geo.loc.y += off_top;
+                geo.loc.y = geo.loc.y.saturating_add(off_top);
             } else if off_bottom > 0 {
-                geo.loc.y -= min(off_bottom, -off_top);
+                let shift = min(off_bottom, off_top.saturating_neg());
+                geo.loc.y = geo.loc.y.saturating_sub(shift);
             }
 
             (_, _, off_top, off_bottom) = compute_offsets(target, geo);
@@ -780,7 +781,7 @@ impl PositionerState {
             // is outside the target rectangle and a clamp would result in a zero-sized geometry.
 
             if off_left > 0 && off_left < geo.size.w {
-                geo.loc.x += off_left;
+                geo.loc.x = geo.loc.x.saturating_add(off_left);
                 geo.size.w -= off_left;
             }
             if off_right > 0 && off_right < geo.size.w {
@@ -795,7 +796,7 @@ impl PositionerState {
             // is outside the target rectangle and a clamp would result in a zero-sized geometry.
 
             if off_top > 0 && off_top < geo.size.h {
-                geo.loc.y += off_top;
+                geo.loc.y = geo.loc.y.saturating_add(off_top);
                 geo.size.h -= off_top;
             }
             if off_bottom > 0 && off_bottom < geo.size.h {
@@ -808,10 +809,16 @@ impl PositionerState {
 }
 
 fn compute_offsets(target: Rectangle<i32, Logical>, popup: Rectangle<i32, Logical>) -> (i32, i32, i32, i32) {
-    let off_left = target.loc.x - popup.loc.x;
-    let off_right = (popup.loc.x + popup.size.w) - (target.loc.x + target.size.w);
-    let off_top = target.loc.y - popup.loc.y;
-    let off_bottom = (popup.loc.y + popup.size.h) - (target.loc.y + target.size.h);
+    // The popup geometry comes from client values, so saturate instead of overflowing.
+    let popup_right = popup.loc.x.saturating_add(popup.size.w);
+    let popup_bottom = popup.loc.y.saturating_add(popup.size.h);
+    let target_right = target.loc.x.saturating_add(target.size.w);
+    let target_bottom = target.loc.y.saturating_add(target.size.h);
+
+    let off_left = target.loc.x.saturating_sub(popup.loc.x);
+    let off_right = popup_right.saturating_sub(target_right);
+    let off_top = target.loc.y.saturating_sub(popup.loc.y);
+    let off_bottom = popup_bottom.saturating_sub(target_bottom);
     (off_left, off_right, off_top, off_bottom)
 }
 
