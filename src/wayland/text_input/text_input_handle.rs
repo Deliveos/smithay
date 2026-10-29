@@ -288,7 +288,9 @@ where
                 pending_state.content_type = Some((hint, purpose));
             }
             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
-                pending_state.cursor_rectangle = Some(Rectangle::new((x, y).into(), (width, height).into()));
+                // The protocol defines no error for this request, and a Size can't be negative.
+                let size = (width.max(0), height.max(0)).into();
+                pending_state.cursor_rectangle = Some(Rectangle::new((x, y).into(), size));
             }
             zwp_text_input_v3::Request::Commit => {
                 let mut new_state = mem::take(pending_state);

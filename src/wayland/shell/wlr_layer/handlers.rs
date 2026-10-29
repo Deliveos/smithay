@@ -186,8 +186,11 @@ where
     ) {
         match request {
             zwlr_layer_surface_v1::Request::SetSize { width, height } => {
+                // Values above i32::MAX would wrap to a negative Size, which can't exist.
+                let width = i32::try_from(width).unwrap_or(i32::MAX);
+                let height = i32::try_from(height).unwrap_or(i32::MAX);
                 let _ = with_surface_pending_state(layer_surface, |data| {
-                    data.size = (width as i32, height as i32).into();
+                    data.size = (width, height).into();
                 });
             }
             zwlr_layer_surface_v1::Request::SetAnchor { anchor } => {

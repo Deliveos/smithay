@@ -210,6 +210,11 @@ where
                 });
             }
             wl_surface::Request::Damage { x, y, width, height } => {
+                // Like damage_buffer below: a Size can't be negative.
+                if width < 0 || height < 0 {
+                    return;
+                }
+
                 let client_scale = state.client_compositor_state(client).client_scale();
                 PrivateSurfaceData::with_states(surface, |states| {
                     states
