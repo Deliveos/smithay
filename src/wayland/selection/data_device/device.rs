@@ -40,8 +40,8 @@ impl<D> Dispatch2<WlDataDevice, D> for DataDeviceUserData
 where
     D: DataDeviceHandler,
     D: SeatHandler,
-    <D as SeatHandler>::PointerFocus: DndFocus<D>,
-    <D as SeatHandler>::TouchFocus: DndFocus<D>,
+    <D as SeatHandler>::PointerFocus: DndFocus<D> + WaylandFocus,
+    <D as SeatHandler>::TouchFocus: DndFocus<D> + WaylandFocus,
     <D as SeatHandler>::KeyboardFocus: WaylandFocus,
     D: 'static,
 {
@@ -77,8 +77,18 @@ where
                 }
 
                 let serial = Serial::from(serial);
+                // Serials come from one counter for all clients, so a client can guess the serial
+                // of another client's click. Only the client that the click went to may start a
+                // drag with it.
                 if let Some(pointer) = seat.get_pointer() {
-                    if pointer.has_grab(serial) {
+                    let grab_focus_is_client = || {
+                        pointer.grab_start_data().is_some_and(|start| {
+                            start
+                                .focus
+                                .is_some_and(|(focus, _)| focus.same_client_as(&resource.id()))
+                        })
+                    };
+                    if pointer.has_grab(serial) && grab_focus_is_client() {
                         if let Some(ref icon) = icon {
                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
                                 resource.post_error(
@@ -111,7 +121,14 @@ where
                     }
                 }
                 if let Some(touch) = seat.get_touch() {
-                    if touch.has_grab(serial) {
+                    let grab_focus_is_client = || {
+                        touch.grab_start_data().is_some_and(|start| {
+                            start
+                                .focus
+                                .is_some_and(|(focus, _)| focus.same_client_as(&resource.id()))
+                        })
+                    };
+                    if touch.has_grab(serial) && grab_focus_is_client() {
                         if let Some(ref icon) = icon {
                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
                                 resource.post_error(
