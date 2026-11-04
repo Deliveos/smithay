@@ -391,6 +391,41 @@ where
 /// input switches to that virtual keyboard's keymap, so its size is bounded.
 const MAX_KEYMAP_SIZE: usize = 1024 * 1024;
 
+/// Read `size` bytes of a client-supplied keymap file.
+///
+/// The keymap is read instead of mapped: the client chooses both `size` and the file, and reading
+/// a mapping past the end of a shorter file raises SIGBUS. Only regular files are read (memfd,
+/// `shm_open` and `O_TMPFILE` files are regular files): pread waits for data on some character
+/// devices, such as `/dev/kmsg`, which the mapping refused at once.
+fn read_keymap(fd: OwnedFd, size: usize) -> Option<Vec<u8>> {
+    let file = File::from(fd);
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            warn!("Failed to stat virtual keyboard keymap: {err:?}");
+            return None;
+        }
+    };
+    if !metadata.file_type().is_file() {
+        warn!("Virtual keyboard keymap is not a regular file");
+        return None;
+    }
+    if metadata.len() < size as u64 {
+        warn!(
+            "Virtual keyboard keymap file is smaller than its size: {} < {size} bytes",
+            metadata.len()
+        );
+        return None;
+    }
+
+    let mut buffer = vec![0u8; size];
+    if let Err(err) = file.read_exact_at(&mut buffer, 0) {
+        warn!("Failed to read virtual keyboard keymap: {err:?}");
+        return None;
+    }
+    Some(buffer)
+}
+
 /// Compile a client-supplied `xkb_v1` keymap, normalizing it to
 /// `XKB_KEYMAP_FORMAT_TEXT_V1`, and returning it if valid.
 fn compile_keymap(fd: OwnedFd, size: usize) -> Option<String> {
@@ -399,14 +434,7 @@ fn compile_keymap(fd: OwnedFd, size: usize) -> Option<String> {
         return None;
     }
 
-    // Read the keymap instead of mapping it: the client chooses both `size` and the file, and
-    // reading a mapping past the end of a shorter file raises SIGBUS. pread also fails on pipes
-    // instead of waiting for data.
-    let mut buffer = vec![0u8; size];
-    if let Err(err) = File::from(fd).read_exact_at(&mut buffer, 0) {
-        warn!("Failed to read virtual keyboard keymap: {err:?}");
-        return None;
-    }
+    let buffer = read_keymap(fd, size)?;
 
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     // SAFETY: the context and the buffer are valid for the call, and xkbcommon doesn't keep the
@@ -469,6 +497,20 @@ mod tests {
 
         let keymap = us_keymap();
         assert!(compile_keymap(keymap_file(keymap.as_bytes()), keymap.len() + 4096).is_none());
+    }
+
+    #[test]
+    fn only_regular_files_are_read() {
+        // /dev/zero stands for character devices where pread waits for data, such as /dev/kmsg.
+        // Its size is 0, so the size check rejects any larger `size`; with a `size` of 0, only
+        // the file type check rejects it.
+        let dev_zero = || File::open("/dev/zero").expect("/dev/zero should open").into();
+        assert!(read_keymap(dev_zero(), 0).is_none());
+        assert!(read_keymap(dev_zero(), 16).is_none());
+
+        let keymap = us_keymap();
+        let read = read_keymap(keymap_file(keymap.as_bytes()), keymap.len());
+        assert_eq!(read.as_deref(), Some(keymap.as_bytes()));
     }
 
     #[test]
