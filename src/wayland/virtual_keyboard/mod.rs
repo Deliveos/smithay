@@ -66,9 +66,11 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::OwnedFd;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use tracing::warn;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::server::{
     zwp_virtual_keyboard_manager_v1::{self, ZwpVirtualKeyboardManagerV1},
@@ -394,9 +396,11 @@ const MAX_KEYMAP_SIZE: usize = 1024 * 1024;
 /// Read `size` bytes of a client-supplied keymap file.
 ///
 /// The keymap is read instead of mapped: the client chooses both `size` and the file, and reading
-/// a mapping past the end of a shorter file raises SIGBUS. Only regular files are read (memfd,
-/// `shm_open` and `O_TMPFILE` files are regular files): pread waits for data on some character
-/// devices, such as `/dev/kmsg`, which the mapping refused at once.
+/// a mapping past the end of a shorter file raises SIGBUS. Only files that the mapping accepted are
+/// read: regular files (memfd, `shm_open` and `O_TMPFILE` files are regular files) that can be
+/// mapped. pread waits for data on some files that the mapping refused at once, such as the
+/// character device `/dev/kmsg`, and the sysfs attribute `/sys/power/wakeup_count` while wakeup
+/// events are being processed.
 fn read_keymap(fd: OwnedFd, size: usize) -> Option<Vec<u8>> {
     let file = File::from(fd);
     let metadata = match file.metadata() {
@@ -417,6 +421,10 @@ fn read_keymap(fd: OwnedFd, size: usize) -> Option<Vec<u8>> {
         );
         return None;
     }
+    if let Err(err) = check_mappable(&file, size) {
+        warn!("Failed to map virtual keyboard keymap: {err:?}");
+        return None;
+    }
 
     let mut buffer = vec![0u8; size];
     if let Err(err) = file.read_exact_at(&mut buffer, 0) {
@@ -424,6 +432,20 @@ fn read_keymap(fd: OwnedFd, size: usize) -> Option<Vec<u8>> {
         return None;
     }
     Some(buffer)
+}
+
+/// Check that `size` bytes of the file can be mapped, without reading them.
+///
+/// Mapping fails at once on files that can't be mapped, such as sysfs and procfs files. The
+/// mapping is removed without touching its pages, so a file that the client shrinks meanwhile
+/// doesn't raise SIGBUS.
+fn check_mappable(file: &File, size: usize) -> rustix::io::Result<()> {
+    // SAFETY: the kernel chooses the address of the new private read-only mapping, so no other
+    // memory is affected, and the mapping is removed without being accessed.
+    unsafe {
+        let addr = mmap(ptr::null_mut(), size, ProtFlags::READ, MapFlags::PRIVATE, file, 0)?;
+        munmap(addr, size)
+    }
 }
 
 /// Compile a client-supplied `xkb_v1` keymap, normalizing it to
@@ -502,8 +524,8 @@ mod tests {
     #[test]
     fn only_regular_files_are_read() {
         // /dev/zero stands for character devices where pread waits for data, such as /dev/kmsg.
-        // Its size is 0, so the size check rejects any larger `size`; with a `size` of 0, only
-        // the file type check rejects it.
+        // Its size is 0, so the size check rejects any larger `size`. With a `size` of 0, the file
+        // type check rejects it first, and mapping 0 bytes would fail too.
         let dev_zero = || File::open("/dev/zero").expect("/dev/zero should open").into();
         assert!(read_keymap(dev_zero(), 0).is_none());
         assert!(read_keymap(dev_zero(), 16).is_none());
@@ -511,6 +533,17 @@ mod tests {
         let keymap = us_keymap();
         let read = read_keymap(keymap_file(keymap.as_bytes()), keymap.len());
         assert_eq!(read.as_deref(), Some(keymap.as_bytes()));
+    }
+
+    #[test]
+    fn files_that_cant_be_mapped_are_rejected() {
+        // Sysfs attributes are regular files with a size of 4096, and mapping them fails. Reading
+        // some of them waits, such as /sys/power/wakeup_count. This one has at least "0\n".
+        let file = File::open("/sys/devices/system/cpu/online").expect("the sysfs file should open");
+        let metadata = file.metadata().unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(metadata.len() >= 1);
+        assert!(read_keymap(file.into(), 1).is_none());
     }
 
     #[test]
