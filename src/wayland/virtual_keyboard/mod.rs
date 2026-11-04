@@ -63,6 +63,8 @@
 //! VirtualKeyboardManagerState::new::<State, _>(&display_handle, |_client| true);
 //! ```
 
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -383,30 +385,97 @@ where
     }
 }
 
+/// Largest `xkb_v1` keymap a virtual keyboard may send, in bytes.
+///
+/// The keymap is read and compiled on the compositor's main thread, and compiled again whenever
+/// input switches to that virtual keyboard's keymap, so its size is bounded.
+const MAX_KEYMAP_SIZE: usize = 1024 * 1024;
+
 /// Compile a client-supplied `xkb_v1` keymap, normalizing it to
 /// `XKB_KEYMAP_FORMAT_TEXT_V1`, and returning it if valid.
 fn compile_keymap(fd: OwnedFd, size: usize) -> Option<String> {
+    if size > MAX_KEYMAP_SIZE {
+        warn!("Virtual keyboard keymap is too large: {size} bytes");
+        return None;
+    }
+
+    // Read the keymap instead of mapping it: the client chooses both `size` and the file, and
+    // reading a mapping past the end of a shorter file raises SIGBUS. pread also fails on pipes
+    // instead of waiting for data.
+    let mut buffer = vec![0u8; size];
+    if let Err(err) = File::from(fd).read_exact_at(&mut buffer, 0) {
+        warn!("Failed to read virtual keyboard keymap: {err:?}");
+        return None;
+    }
+
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    // SAFETY: we can map the keymap into the memory.
-    let keymap = match unsafe {
-        xkb::Keymap::new_from_fd(
-            &context,
-            fd,
-            size,
+    // SAFETY: the context and the buffer are valid for the call, and xkbcommon doesn't keep the
+    // buffer. The keymap pointer is checked for null and then owned by the `Keymap`.
+    let keymap = unsafe {
+        let ptr = xkb::ffi::xkb_keymap_new_from_buffer(
+            context.get_raw_ptr(),
+            buffer.as_ptr().cast(),
+            buffer.len(),
             xkb::KEYMAP_FORMAT_TEXT_V1,
             xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-    } {
-        Ok(Some(keymap)) => keymap,
-        Ok(None) => {
+        );
+        if ptr.is_null() {
             warn!("Failed to compile virtual keyboard keymap");
             return None;
         }
-        Err(err) => {
-            warn!("Failed to map virtual keyboard keymap: {err:?}");
-            return None;
-        }
+        xkb::Keymap::from_raw_ptr(ptr)
     };
 
     Some(keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use rustix::fs::{MemfdFlags, memfd_create};
+
+    use super::*;
+
+    fn keymap_file(bytes: &[u8]) -> OwnedFd {
+        let fd = memfd_create("smithay-test-keymap", MemfdFlags::CLOEXEC).unwrap();
+        let mut file = File::from(fd);
+        file.write_all(bytes).unwrap();
+        file.into()
+    }
+
+    fn us_keymap() -> String {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap =
+            xkb::Keymap::new_from_names(&context, "", "", "us", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)
+                .expect("the us layout should compile");
+        keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+    }
+
+    #[test]
+    fn keymap_is_compiled() {
+        let keymap = us_keymap();
+        // With and without the terminating NUL that clients usually include in `size`.
+        let mut bytes = keymap.clone().into_bytes();
+        assert!(compile_keymap(keymap_file(&bytes), bytes.len()).is_some());
+        bytes.push(0);
+        assert!(compile_keymap(keymap_file(&bytes), bytes.len()).is_some());
+    }
+
+    #[test]
+    fn size_larger_than_the_file_fails_without_sigbus() {
+        // Mapping 4096 bytes of an empty file succeeds, and reading the mapping raises SIGBUS.
+        assert!(compile_keymap(keymap_file(&[]), 4096).is_none());
+
+        let keymap = us_keymap();
+        assert!(compile_keymap(keymap_file(keymap.as_bytes()), keymap.len() + 4096).is_none());
+    }
+
+    #[test]
+    fn too_large_size_is_rejected() {
+        let keymap = us_keymap();
+        let mut bytes = keymap.into_bytes();
+        bytes.resize(MAX_KEYMAP_SIZE + 1, b' ');
+        assert!(compile_keymap(keymap_file(&bytes), bytes.len()).is_none());
+    }
 }
