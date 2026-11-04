@@ -111,6 +111,7 @@ mod transaction;
 mod tree;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::{any::Any, sync::Mutex};
@@ -613,7 +614,8 @@ pub trait CompositorHandler {
 pub struct CompositorState {
     compositor: GlobalId,
     subcompositor: GlobalId,
-    surfaces: Vec<WlSurface>,
+    // A set, so that removing a destroyed surface doesn't scan every surface of every client.
+    surfaces: HashSet<WlSurface>,
 }
 
 /// Per-client state of a compositor
@@ -724,7 +726,7 @@ impl CompositorState {
         CompositorState {
             compositor,
             subcompositor,
-            surfaces: Vec::new(),
+            surfaces: HashSet::new(),
         }
     }
 
